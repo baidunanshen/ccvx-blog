@@ -1,0 +1,205 @@
+name: Deploy Blog to Baota
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-blog-production
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  VITEPRESS_BASE: /
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/www/wwwroot/ccvx-blog' }}
+  DEPLOY_URL: ${{ vars.DEPLOY_URL || 'https://www.ccvx.top' }}
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        run: pnpm build
+
+      - name: Check build output
+        run: |
+          test -s docs/.vitepress/dist/index.html
+          test -d docs/.vitepress/dist/assets
+          test -d docs/.vitepress/dist/pagefind
+
+      - name: Validate deployment configuration
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          for name in DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_SSH_PRIVATE_KEY DEPLOY_KNOWN_HOSTS; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::缺少 GitHub Actions Secret: ${name}"
+              exit 1
+            fi
+          done
+
+          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            echo "::error::DEPLOY_HOST 格式不正确"
+            exit 1
+          fi
+
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]+$ ]]; then
+            echo "::error::DEPLOY_PORT 必须是数字"
+            exit 1
+          fi
+
+          if [[ ! "$DEPLOY_USER" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::DEPLOY_USER 格式不正确"
+            exit 1
+          fi
+
+          if [[ ! "$DEPLOY_PATH" =~ ^/www/wwwroot/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::DEPLOY_PATH 必须是 /www/wwwroot/ 下的单层站点目录"
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/baota_deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/baota_deploy_key" "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/baota_deploy_key" > /dev/null
+
+      - name: Check server target
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -p "$DEPLOY_PORT" \
+            -i "$HOME/.ssh/baota_deploy_key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "test -d '$DEPLOY_PATH' && test -w '$DEPLOY_PATH' && command -v rsync >/dev/null"
+
+      - name: Back up current release
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -p "$DEPLOY_PORT" \
+            -i "$HOME/.ssh/baota_deploy_key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -e; backup_dir=\"\$HOME/ccvx-blog-backups\"; mkdir -p \"\$backup_dir\"; tar -czf \"\$backup_dir/ccvx-blog-${GITHUB_SHA:0:12}-$(date +%Y%m%d-%H%M%S).tar.gz\" -C '$DEPLOY_PATH' ."
+
+      - name: Upload static site
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+
+          rsync \
+            --recursive \
+            --links \
+            --perms \
+            --times \
+            --compress \
+            --delay-updates \
+            --delete-after \
+            --chmod=D755,F644 \
+            --exclude=/.user.ini \
+            --exclude=/.htaccess \
+            -e "ssh -p ${DEPLOY_PORT} -i $HOME/.ssh/baota_deploy_key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15" \
+            docs/.vitepress/dist/ \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+
+      - name: Verify deployed files
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -p "$DEPLOY_PORT" \
+            -i "$HOME/.ssh/baota_deploy_key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "test -s '$DEPLOY_PATH/index.html' && test -d '$DEPLOY_PATH/assets' && test -d '$DEPLOY_PATH/pagefind'"
+
+      - name: Smoke test public URL
+        if: env.DEPLOY_URL != ''
+        run: |
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-delay 2 \
+            --output /dev/null \
+            "${DEPLOY_URL%/}/?deployed=${GITHUB_SHA}"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### 博客部署成功"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Target: \`${DEPLOY_PATH}\`"
+            echo "- Public URL: ${DEPLOY_URL:-未配置}"
+          } >> "$GITHUB_STEP_SUMMARY"
